@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.checkpoints/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.DS_Store
+*.json
+!config.json
