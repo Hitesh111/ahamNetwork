@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re
+import secrets
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
@@ -18,7 +18,11 @@ class EvaluationResult:
     total: int = 0
 
 
-def _render_test_code(test_cases: Sequence[tuple[Any, Any]]) -> str:
+def _make_result_key() -> str:
+    return f"__gossip_eval_{secrets.token_hex(8)}"
+
+
+def _render_test_code(test_cases: Sequence[tuple[Any, Any]], result_key: str) -> str:
     literal_cases = repr(list(test_cases))
     total = len(test_cases)
     return f"""
@@ -27,7 +31,7 @@ total_count = {total}
 test_cases = {literal_cases}
 solve_fn = globals().get("solve")
 if solve_fn is None:
-    print("PASSED=0;TOTAL=" + str(total_count))
+    {result_key} = {{"passed_count": 0, "total_count": total_count}}
 else:
     for input_value, expected in test_cases:
         try:
@@ -36,17 +40,8 @@ else:
                 passed_count += 1
         except Exception:
             pass
-    print("PASSED=" + str(passed_count) + ";TOTAL=" + str(total_count))
+    {result_key} = {{"passed_count": passed_count, "total_count": total_count}}
 """
-
-
-def _parse_counts(output: str) -> tuple[int, int]:
-    match = re.search(r"PASSED=(\d+);TOTAL=(\d+)", output or "")
-    if not match:
-        return 0, 0
-    return int(match.group(1)), int(match.group(2))
-
-
 def evaluate_solution(
     code: str,
     test_cases: Sequence[tuple[Any, Any]],
@@ -54,9 +49,15 @@ def evaluate_solution(
     behavior_fn: Callable[[str, float, int, int], tuple[float, ...]] | None = None,
 ) -> EvaluationResult:
     sandbox = sandbox or Sandbox()
-    test_code = _render_test_code(test_cases)
-    result = sandbox.execute(code, test_code)
-    passed_count, total = _parse_counts(result.output)
+    result_key = _make_result_key()
+    result_token = secrets.token_hex(16)
+    test_code = _render_test_code(test_cases, result_key)
+    result = sandbox.execute(code, test_code, result_key=result_key, result_token=result_token)
+    if result.result and "passed_count" in result.result and "total_count" in result.result:
+        passed_count = int(result.result.get("passed_count", 0))
+        total = int(result.result.get("total_count", 0))
+    else:
+        passed_count, total = 0, len(test_cases)
     score = passed_count / max(1, total)
     behavior = behavior_fn(code, score, passed_count, total) if behavior_fn else (score,)
     passed = result.error is None and total > 0 and passed_count == total

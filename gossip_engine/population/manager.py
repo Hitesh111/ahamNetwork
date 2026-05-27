@@ -77,6 +77,12 @@ class PopulationManager:
         if archive.occupancy() >= 0.8 and current_best < self.cfg.growth_archive_saturation_trust:
             signals.append("archive_saturation")
 
+        elite = archive.get_elite()
+        if elite is not None and lineage is not None and hasattr(lineage, "get_node"):
+            node = lineage.get_node(elite.artifact_hash)
+            if node is not None and node.lineage_depth < self.cfg.growth_shallow_lineage_depth:
+                signals.append("shallow_lineage")
+
         if not signals:
             self._consecutive_growth_rounds = 0
 
@@ -119,8 +125,8 @@ class PopulationManager:
         )
 
         for _ in range(to_add):
-            if llm_backend and ("high_failure_rate" in signals or "archive_saturation" in signals):
-                immigrant = create_immigrant_agent(self.cfg._domain_module or "", llm_backend, **rates)
+            if llm_backend and domain_prompt:
+                immigrant = create_immigrant_agent(domain_prompt or self.cfg._domain_module or "", llm_backend, **rates)
             else:
                 immigrant = create_agent(state=CognitiveState.RAJAS, **rates)
             self.agents.append(immigrant)

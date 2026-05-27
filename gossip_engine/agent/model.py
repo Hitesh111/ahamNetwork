@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Any
 from ..utils.ids import new_id
 from ..memory.l1_agent_local import AgentLocalMemory
 from .state_machine import StateMachine, CognitiveState
@@ -15,6 +16,9 @@ class Agent:
     l1_memory: AgentLocalMemory = field(default_factory=lambda: AgentLocalMemory())
     state_machine: StateMachine = field(default_factory=StateMachine)
     neighbor_weights: dict[str, float] = field(default_factory=dict)
+    rumor_mill: dict[str, dict[str, Any]] = field(default_factory=dict)
+    outgoing_messages: list[dict[str, Any]] = field(default_factory=list)
+    gossip_enabled: bool = True
     age: int = 0
     generation: int = 0
     _prev_trust: float = 0.5
@@ -36,3 +40,6 @@ class Agent:
         self.state_machine = StateMachine(CognitiveState.RAJAS)
         self.trust_score = 0.5
         self._prev_trust = 0.5
+        self.gossip_enabled = True
+        self.rumor_mill.clear()
+        self.outgoing_messages.clear()

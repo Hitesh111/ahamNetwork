@@ -5,14 +5,24 @@ import argparse
 from pathlib import Path
 
 from .config import Config
+from .cli import run_interactive, _print_summary
 from .orchestrator import Orchestrator
+
+
+def _prompt(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return value or default
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Gossip Engine — evolutionary AI cognition substrate"
     )
-    parser.add_argument("--domain", "-d", type=str, required=True,
+    parser.add_argument("--domain", "-d", type=str, default="",
                         help="Path to domain module (Python file)")
     parser.add_argument("--config", "-c", type=str, default="",
                         help="Config file (.json or .yaml)")
@@ -22,6 +32,8 @@ def main():
                         help="LLM provider (overrides config)")
     parser.add_argument("--model", "-m", type=str, default="",
                         help="LLM model (overrides config)")
+    parser.add_argument("--interactive", "-i", action="store_true",
+                        help="Open an interactive CLI after initialization")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose logging")
     args = parser.parse_args()
@@ -55,13 +67,23 @@ def main():
 
     config._validate()
 
-    domain_path = Path(args.domain)
+    domain_value = args.domain
+    if not domain_value and args.interactive:
+        if sys.stdin.isatty():
+            domain_value = _prompt("Domain module path", "domains/palindrome.py")
+        else:
+            domain_value = "domains/palindrome.py"
+    if not domain_value:
+        print("Error: domain module not provided. Use --domain or --interactive.", file=sys.stderr)
+        sys.exit(1)
+
+    domain_path = Path(domain_value)
     if not domain_path.exists():
-        print(f"Error: domain module not found: {args.domain}", file=sys.stderr)
+        print(f"Error: domain module not found: {domain_value}", file=sys.stderr)
         sys.exit(1)
 
     orch = Orchestrator(config)
-    orch.load_domain(args.domain)
+    orch.load_domain(domain_value)
 
     print(f"=== Gossip Engine ===")
     provider = config.resolve_llm_provider()
@@ -75,20 +97,14 @@ def main():
     print(f"Initial pop: {config.initial_population}-{config.initial_population + config.initial_population_jitter}")
     print()
 
+    if args.interactive:
+        run_interactive(orch, default_step_rounds=max(1, args.rounds or 1))
+        return
+
     result = orch.run()
 
     print()
-    print("=== Results ===")
-    print(f"  Rounds:         {result['rounds']}")
-    print(f"  Time:           {result['elapsed_seconds']:.1f}s")
-    print(f"  Final pop:      {result['population_size']}")
-    print(f"  Archive cells:  {result['archive_cells']}")
-    print(f"  Max trust:      {result['max_trust']:.3f}")
-    print(f"  Solved:         {result['solved']}")
-    if result['best_genome']:
-        print()
-        print("Best genome:")
-        print(result['best_genome'][:500])
+    _print_summary(result)
 
 
 if __name__ == "__main__":

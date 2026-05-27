@@ -37,6 +37,9 @@ def _serialize_agent(agent: Agent) -> dict[str, Any]:
         "generation": agent.generation,
         "_prev_trust": agent._prev_trust,
         "neighbor_weights": dict(agent.neighbor_weights),
+        "rumor_mill": _json_safe(agent.rumor_mill),
+        "outgoing_messages": _json_safe(agent.outgoing_messages),
+        "gossip_enabled": agent.gossip_enabled,
         "state_machine": {
             "state": agent.state_machine.state.value,
             "mutation_rates": {
@@ -91,6 +94,7 @@ def save_checkpoint(path: str | Path, orchestrator, round_index: int, solved: bo
         "prev_best_trust": orchestrator.population._prev_best_trust,
         "artifact_store_path": getattr(orchestrator.artifact_store, "path", ""),
         "lineage_store_path": getattr(orchestrator.lineage_store, "path", ""),
+        "gossip_bus": orchestrator.gossip_bus.snapshot() if getattr(orchestrator, "gossip_bus", None) else {},
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path

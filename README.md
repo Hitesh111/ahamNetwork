@@ -8,13 +8,16 @@ interacting populations of AI micro-agents.
 pip install httpx pyyaml
 python3 -m gossip_engine.main --domain domains/palindrome.py --rounds 50
 
+# interactive shell
+python3 -m gossip_engine.main --domain domains/palindrome.py --interactive
+
 # with an LLM
 export GOSSIP_LLM_PROVIDER=openai
 export GOSSIP_OPENAI_KEY=sk-...
 python3 -m gossip_engine.main --domain domains/palindrome.py --rounds 100
 ```
 
-**Status**: Phase 0–1 MVP complete.
+**Status**: Phase 0–2 MVP complete.
 - [PLAN.md](./PLAN.md) — roadmap
 - [IMPLEMENTATION.md](./IMPLEMENTATION.md) — architecture
 - [MEMORY_ARCHITECTURE.md](./MEMORY_ARCHITECTURE.md) — memory substrate design

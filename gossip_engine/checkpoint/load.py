@@ -42,6 +42,9 @@ def _restore_agent(payload: dict[str, Any]) -> Agent:
         l1_memory=_restore_memory(payload["l1_memory"]),
         state_machine=state_machine,
         neighbor_weights=dict(payload["neighbor_weights"]),
+        rumor_mill=dict(payload.get("rumor_mill", {})),
+        outgoing_messages=list(payload.get("outgoing_messages", [])),
+        gossip_enabled=bool(payload.get("gossip_enabled", True)),
         age=payload["age"],
         generation=payload["generation"],
         _prev_trust=payload["_prev_trust"],
@@ -69,6 +72,7 @@ def load_checkpoint(path: str | Path):
     orchestrator.population._failure_window = list(data.get("failure_window", []))
     orchestrator.population._rounds_since_improvement = data.get("rounds_since_improvement", 0)
     orchestrator.population._prev_best_trust = data.get("prev_best_trust", 0.0)
+    orchestrator.gossip_bus.restore(data.get("gossip_bus", {}))
 
     archive = MAPElitesArchive(
         dimensions=config.archive_dimensions,
@@ -86,4 +90,5 @@ def load_checkpoint(path: str | Path):
             coords=tuple(entry["coords"]),
         )
     orchestrator.archive = archive
+    orchestrator._sync_gossip_state()
     return orchestrator

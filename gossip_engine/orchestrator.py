@@ -4,6 +4,7 @@ import logging
 import random
 import time
 from pathlib import Path
+from typing import Any
 
 from .agent.factory import create_immigrant_agent
 from .agent.model import Agent
@@ -12,6 +13,8 @@ from .checkpoint.save import save_checkpoint
 from .config import Config
 from .evolution.archive import MAPElitesArchive
 from .evolution.mutation import MutationEngine
+from .evolution.recombination import recombine
+from .gossip.protocol import GossipBus, artifact_from_agent, artifact_from_entry, artifact_priority
 from .grounding.sandbox import Sandbox
 from .grounding.scorer import Scorer
 from .grounding.validator import evaluate_solution
@@ -29,6 +32,7 @@ logger = logging.getLogger("gossip_engine")
 class Orchestrator:
     def __init__(self, config: Config):
         self.cfg = config
+        random.seed(config.seed)
         self.provider = config.resolve_llm_provider()
         self.model = config.resolve_llm_model(self.provider)
         self.logger = setup_logging(config.log_level)
@@ -46,6 +50,10 @@ class Orchestrator:
         self.archive = MAPElitesArchive(
             dimensions=config.archive_dimensions,
             resolution=config.archive_resolution,
+        )
+        self.gossip_bus = GossipBus(
+            fanout=config.neighbor_fanout,
+            rumor_limit=config.rumor_mill_size,
         )
         self.exec_cache = ExecutionCache(max_size=config.cache_max_size)
         self.population = PopulationManager(config)
@@ -71,6 +79,7 @@ class Orchestrator:
             raise ValueError(f"Unable to load domain module: {module_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        self.cfg._domain_module = module_path
         self._domain_module = mod
         self._domain_fitness = getattr(mod, "fitness", None)
         self._domain_descriptor = getattr(mod, "behavioral_descriptor", None)
@@ -80,6 +89,62 @@ class Orchestrator:
         self._domain_solved = getattr(mod, "is_solved", None)
         self.mutation_engine.domain_prompt = self._domain_prompt
         logger.info(f"Loaded domain: {module_path}")
+
+    def _sync_gossip_state(self):
+        self.gossip_bus.sync_population(self.population.agents)
+        if self.archive.num_cells():
+            self.gossip_bus.seed_from_archive(self.population.agents, self.archive)
+
+    def _select_archive_partner(self, agent) -> dict[str, Any] | None:
+        candidates = [entry for entry in self.archive._cells.values() if entry.genome and entry.genome != agent.genome]
+        if not candidates:
+            return None
+        diverse = [entry for entry in candidates if tuple(entry.coords) != tuple(agent.niche_coords)]
+        pool = diverse or candidates
+        pool.sort(key=lambda entry: (entry.trust_score, entry.novelty_score), reverse=True)
+        if len(pool) > 1 and random.random() < self.cfg.selection_epsilon:
+            entry = random.choice(pool[: max(2, min(len(pool), self.cfg.neighbor_fanout * 2))])
+        else:
+            entry = pool[0]
+        return artifact_from_entry(entry, cognitive_state=agent.cognitive_state.value, source="archive")
+
+    def _select_recombination_partner(self, agent) -> dict[str, Any] | None:
+        candidates: list[dict[str, Any]] = []
+        rumor = self.gossip_bus.best_rumor(agent)
+        if rumor and rumor.get("genome") and rumor.get("genome") != agent.genome:
+            candidates.append(rumor)
+        archive_partner = self._select_archive_partner(agent)
+        if archive_partner and archive_partner.get("genome") and archive_partner["genome"] != agent.genome:
+            candidates.append(archive_partner)
+        if not candidates:
+            return None
+        candidates.sort(key=artifact_priority, reverse=True)
+        if len(candidates) > 1 and random.random() < 0.35:
+            return random.choice(candidates)
+        return candidates[0]
+
+    def status_snapshot(self) -> dict[str, Any]:
+        elite = self.archive.get_elite()
+        solved = False
+        if self._domain_solved and elite:
+            try:
+                solved = bool(self._domain_solved(elite.genome, elite.trust_score))
+            except Exception:
+                solved = False
+        return {
+            "generation": self.generation,
+            "population_size": self.population.size,
+            "archive_cells": self.archive.num_cells(),
+            "archive_occupancy": self.archive.occupancy(),
+            "max_trust": self.archive.max_trust(),
+            "solved": solved,
+            "gossip_pending": self.gossip_bus.pending_count(),
+            "population_states": self.population.get_metrics().get("states", {}),
+            "best_genome": elite.genome if elite else "",
+            "best_hash": elite.artifact_hash if elite else "",
+            "best_trust": elite.trust_score if elite else 0.0,
+            "agents": [self.gossip_bus.describe_agent(agent) for agent in self.population.agents],
+        }
 
     def _default_behavior(self, code: str) -> tuple[float, ...]:
         h = content_hash(code)
@@ -158,6 +223,7 @@ class Orchestrator:
         self,
         agent: Agent,
         parent_hash: str,
+        secondary_parent_hash: str,
         mutation_type: str,
         passed: bool,
         score: float,
@@ -165,7 +231,7 @@ class Orchestrator:
         runtime_ms: float,
         output: str,
         error: str | None,
-    ) -> float:
+    ) -> dict[str, Any]:
         artifact_hash = content_hash(agent.genome)
         novelty = self.scorer.compute_novelty(list(behavior), self._all_embeddings())
         old_trust = agent._prev_trust
@@ -182,6 +248,7 @@ class Orchestrator:
         agent._prev_trust = trust
         agent.niche_coords = self.archive._discretize(behavior)
         agent.state_machine.transition(trust, trust - old_trust)
+        agent.gossip_enabled = agent.cognitive_state != CognitiveState.TAMAS
         agent.lineage_hash = artifact_hash
 
         inserted = self.archive.insert(
@@ -195,26 +262,47 @@ class Orchestrator:
         )
 
         lineage_depth = 0
-        if parent_hash:
-            parent_node = self.lineage_store.get_node(parent_hash)
-            lineage_depth = parent_node.lineage_depth + 1 if parent_node else 1
+        lineage_parents = [hash_ for hash_ in (parent_hash, secondary_parent_hash) if hash_]
+        if lineage_parents:
+            parent_depths = []
+            for hash_ in lineage_parents:
+                parent_node = self.lineage_store.get_node(hash_)
+                if parent_node:
+                    parent_depths.append(parent_node.lineage_depth)
+            lineage_depth = (max(parent_depths) if parent_depths else -1) + 1
 
         lineage_node = self.lineage_store.get_node(artifact_hash)
         if lineage_node is None:
-            self.lineage_store.record_mutation(
-                parent_hash=parent_hash,
-                artifact_hash=artifact_hash,
-                agent_id=agent.id,
-                mutation_type=mutation_type,
-                params={
-                    "score": score,
-                    "passed": passed,
-                    "runtime_ms": runtime_ms,
-                    "inserted": inserted,
-                },
-                trust_score=trust,
-                niche_bucket=agent.niche_coords,
-            )
+            if mutation_type == "recombine" and secondary_parent_hash:
+                self.lineage_store.record_recombination(
+                    parent_hash_a=parent_hash,
+                    parent_hash_b=secondary_parent_hash,
+                    artifact_hash=artifact_hash,
+                    agent_id=agent.id,
+                    params={
+                        "score": score,
+                        "passed": passed,
+                        "runtime_ms": runtime_ms,
+                        "inserted": inserted,
+                    },
+                    trust_score=trust,
+                    niche_bucket=agent.niche_coords,
+                )
+            else:
+                self.lineage_store.record_mutation(
+                    parent_hash=parent_hash,
+                    artifact_hash=artifact_hash,
+                    agent_id=agent.id,
+                    mutation_type=mutation_type,
+                    params={
+                        "score": score,
+                        "passed": passed,
+                        "runtime_ms": runtime_ms,
+                        "inserted": inserted,
+                    },
+                    trust_score=trust,
+                    niche_bucket=agent.niche_coords,
+                )
             lineage_node = self.lineage_store.get_node(artifact_hash)
         if lineage_node:
             lineage_depth = lineage_node.lineage_depth
@@ -242,14 +330,60 @@ class Orchestrator:
         )
 
         self.population.record_failure(passed)
-        return trust
+        artifact = artifact_from_agent(
+            agent,
+            novelty_score=novelty,
+            behavior=behavior,
+            mutation_type=mutation_type,
+            passed=passed,
+            score=score,
+            runtime_ms=runtime_ms,
+            output=output,
+            error=error,
+            source="live",
+        )
+        artifact["lineage_depth"] = lineage_depth
+        artifact["secondary_parent_hash"] = secondary_parent_hash
+        artifact["inserted_into_archive"] = inserted
+        return {
+            "trust": trust,
+            "artifact": artifact,
+            "artifact_hash": artifact_hash,
+            "novelty": novelty,
+            "lineage_depth": lineage_depth,
+            "inserted": inserted,
+        }
 
-    def _tick_agent(self, agent: Agent) -> float:
+    def _tick_agent(self, agent: Agent) -> dict[str, Any]:
+        incoming = self.gossip_bus.drain(agent.id)
+        if incoming:
+            self.gossip_bus.ingest(agent, incoming)
+
         parent_hash = ""
+        secondary_parent_hash = ""
         mutation_type = "seed"
         mr = agent.state_machine.mutation_rate
+        recombination_rate = agent.state_machine.recombination_rate
 
-        if agent.genome and random.random() < mr:
+        if agent.genome and random.random() < recombination_rate:
+            partner = self._select_recombination_partner(agent)
+            if partner and partner.get("genome"):
+                parent_hash = content_hash(agent.genome)
+                secondary_parent_hash = partner.get("artifact_hash", "")
+                recombined = recombine(agent.genome, partner["genome"])
+                if recombined:
+                    agent.genome = recombined
+                    mutation_type = "recombine"
+                else:
+                    mutation_type = "mutate"
+            else:
+                parent_hash = content_hash(agent.genome)
+                agent.genome = self.mutation_engine.mutate(
+                    agent.genome,
+                    mutation_rate=mr,
+                )
+                mutation_type = "mutate"
+        elif agent.genome:
             parent_hash = content_hash(agent.genome)
             agent.genome = self.mutation_engine.mutate(
                 agent.genome,
@@ -266,9 +400,10 @@ class Orchestrator:
                 mutation_type = "seed"
 
         passed, score, behavior, runtime_ms, output, error = self._evaluate_genome(agent.genome)
-        return self._record_result(
+        result = self._record_result(
             agent=agent,
             parent_hash=parent_hash,
+            secondary_parent_hash=secondary_parent_hash,
             mutation_type=mutation_type,
             passed=passed,
             score=score,
@@ -277,6 +412,14 @@ class Orchestrator:
             output=output,
             error=error,
         )
+
+        artifact = result["artifact"]
+        agent.rumor_mill[artifact["artifact_hash"]] = artifact
+        self.gossip_bus.ingest(agent, [artifact])
+        best = self.gossip_bus.best_rumor(agent) or artifact
+        if agent.gossip_enabled:
+            self.gossip_bus.emit(agent, best, self.population.agents)
+        return result
 
     def _seed_population(self):
         for index, agent in enumerate(self.population.agents):
@@ -296,6 +439,7 @@ class Orchestrator:
         if not self.population.agents:
             self.population.initialize()
             self._seed_population()
+        self._sync_gossip_state()
 
         solved = False
         completed_rounds = self.generation
@@ -306,8 +450,6 @@ class Orchestrator:
             self.generation = completed_rounds
 
             for agent in self.population.agents:
-                if agent.cognitive_state == CognitiveState.TAMAS:
-                    continue
                 self._tick_agent(agent)
 
             if completed_rounds % self.cfg.growth_check_interval == 0:
@@ -317,11 +459,13 @@ class Orchestrator:
                 )
                 if growth_signals:
                     self.population.grow(growth_signals, self.llm, self._domain_prompt)
+                    self._sync_gossip_state()
 
             if completed_rounds % self.cfg.shrink_check_interval == 0:
                 shrink_signals = self.population.check_shrink_signals(self.archive, solved)
                 if shrink_signals:
                     self.population.shrink(shrink_signals)
+                    self._sync_gossip_state()
 
             if completed_rounds % 10 == 0:
                 elite = self.archive.get_elite()

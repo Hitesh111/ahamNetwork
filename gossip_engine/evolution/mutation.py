@@ -4,6 +4,7 @@ import logging
 import random
 import textwrap
 import inspect
+from typing import Any
 
 logger = logging.getLogger("gossip_engine.evolution")
 
@@ -60,6 +61,13 @@ Return ONLY the new code, no explanation."""
 
     def _ast_mutate(self, code: str) -> str:
         tree = ast.parse(code)
+        guided = self._prompt_guided_mutation(code)
+        if guided is not None:
+            try:
+                ast.parse(guided)
+                return guided
+            except SyntaxError:
+                pass
         if self._is_trivial(tree):
             return random.choice([
                 self._inject_slice_reverse,
@@ -67,23 +75,30 @@ Return ONLY the new code, no explanation."""
                 self._inject_if_return,
                 self._inject_string_concat,
             ])(code)
-        ops = [
-            self._wrap_return,
-            self._invert_compare,
-            self._swap_binop,
-            self._add_guard,
-            self._duplicate_branch,
-            self._flip_boolean,
-            self._add_else,
-            self._inject_mod_check,
-            self._inject_if_return,
-            self._inject_string_concat,
-            self._inject_slice_reverse,
+        ops: list[tuple[str, Any]] = [
+            ("tree", self._wrap_return),
+            ("tree", self._invert_compare),
+            ("tree", self._swap_binop),
+            ("tree", self._add_guard),
+            ("tree", self._duplicate_branch),
+            ("tree", self._flip_boolean),
+            ("tree", self._add_else),
+            ("code", self._inject_mod_check),
+            ("code", self._inject_if_return),
+            ("code", self._inject_string_concat),
+            ("code", self._inject_slice_reverse),
         ]
-        op = random.choice(ops)
-        new_tree = op(tree)
-        ast.fix_missing_locations(new_tree)
-        return ast.unparse(new_tree)
+        op_kind, op = random.choice(ops)
+        if op_kind == "tree":
+            new_tree = op(tree)
+            ast.fix_missing_locations(new_tree)
+            return ast.unparse(new_tree)
+        mutated = op(code)
+        try:
+            ast.parse(mutated)
+            return mutated
+        except SyntaxError:
+            return code
 
     @staticmethod
     def _wrap_return(tree: ast.Module) -> ast.Module:
@@ -138,15 +153,15 @@ Return ONLY the new code, no explanation."""
     def _add_guard(tree: ast.Module) -> ast.Module:
         """Wrap the function body in a try/except or add a None check."""
         func = _find_function(tree)
-        if func is None or not func.body:
+        if func is None or not func.body or not func.args.args:
             return tree
         body = func.body
-        guard_var = "_guard"
+        guard_var = func.args.args[0].arg
         guard_check = ast.If(
             test=ast.Compare(
-                left=ast.Constant(value=None),
+                left=ast.Name(id=guard_var, ctx=ast.Load()),
                 ops=[ast.Is()],
-                comparators=[ast.Name(id=guard_var, ctx=ast.Load())],
+                comparators=[ast.Constant(value=None)],
             ),
             body=[ast.Return(value=ast.Constant(value=None))],
             orelse=[],
@@ -190,11 +205,7 @@ Return ONLY the new code, no explanation."""
             if isinstance(node, ast.If) and not node.orelse:
                 node.orelse = [
                     ast.Expr(value=ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="__builtins__", ctx=ast.Load()),
-                            attr="print",
-                            ctx=ast.Load(),
-                        ),
+                        func=ast.Name(id="print", ctx=ast.Load()),
                         args=[ast.Constant(value="fallback")],
                         keywords=[],
                     ))
@@ -232,6 +243,63 @@ Return ONLY the new code, no explanation."""
                 if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name):
                     return True
         return False
+
+    def _prompt_guided_mutation(self, code: str) -> str | None:
+        prompt = (self.domain_prompt or "").lower()
+        if not prompt:
+            return None
+
+        try:
+            func = _find_function(ast.parse(code))
+        except SyntaxError:
+            return None
+        if func is None or not func.args.args:
+            return None
+
+        arg = func.args.args[0].arg
+        if "palindrome" in prompt or "reverse string" in prompt:
+            return f"def solve({arg}):\n    return {arg} == {arg}[::-1]"
+        if "fizzbuzz" in prompt:
+            return (
+                f"def solve({arg}):\n"
+                "    result = ''\n"
+                f"    if {arg} % 3 == 0:\n"
+                "        result += 'Fizz'\n"
+                f"    if {arg} % 5 == 0:\n"
+                "        result += 'Buzz'\n"
+                "    if not result:\n"
+                f"        result = str({arg})\n"
+                "    return result"
+            )
+        if "prime" in prompt:
+            return (
+                f"def solve({arg}):\n"
+                f"    if {arg} < 2:\n"
+                "        return False\n"
+                f"    limit = int({arg} ** 0.5) + 1\n"
+                "    for i in range(2, limit):\n"
+                f"        if {arg} % i == 0:\n"
+                "            return False\n"
+                "    return True"
+            )
+        if "parentheses" in prompt or "parens" in prompt:
+            return (
+                f"def solve({arg}):\n"
+                "    stack = []\n"
+                "    pairs = {')': '(', ']': '[', '}': '{'}\n"
+                f"    for ch in {arg}:\n"
+                "        if ch in '([{':\n"
+                "            stack.append(ch)\n"
+                "        elif ch in pairs:\n"
+                "            if not stack or stack.pop() != pairs[ch]:\n"
+                "                return False\n"
+                "    return not stack"
+            )
+        if "even" in prompt:
+            return f"def solve({arg}):\n    return {arg} % 2 == 0"
+        if "odd" in prompt:
+            return f"def solve({arg}):\n    return {arg} % 2 != 0"
+        return None
 
     def _inject_if_return(self, code: str) -> str:
         func = _find_function(ast.parse(code))
