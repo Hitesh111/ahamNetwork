@@ -23,6 +23,7 @@ from .llm.backend import create_backend
 from .memory.l2_episodic import ArtifactRecord, ArtifactStore
 from .memory.l3_lineage import LineageStore
 from .memory.l4_codebook import CodebookStore
+from .memory.l5_workspace import GlobalWorkspace
 from .population.manager import PopulationManager
 from .utils.ids import content_hash
 from .utils.log import setup_logging
@@ -66,6 +67,7 @@ class Orchestrator:
         self.artifact_store = ArtifactStore(checkpoint_dir / "artifacts.sqlite3")
         self.lineage_store = LineageStore(checkpoint_dir / "lineage.sqlite3")
         self.codebook = CodebookStore(checkpoint_dir / "codebook.sqlite3")
+        self.global_workspace = GlobalWorkspace(checkpoint_dir / "workspace.sqlite3")
 
         self._domain_module = None
         self._domain_fitness = None
@@ -364,6 +366,12 @@ class Orchestrator:
 
         if trust > 0.8:
             self._propagate_credit(artifact_hash, trust)
+
+        if inserted or trust > 0.6:
+            self.global_workspace.push_candidate(
+                agent.id, agent.genome, trust, novelty, artifact_hash, self.generation
+            )
+
         return {
             "trust": trust,
             "artifact": artifact,
@@ -519,6 +527,20 @@ class Orchestrator:
                     self.population.shrink(shrink_signals)
                     self._sync_gossip_state()
 
+            if completed_rounds % 5 == 0:
+                try:
+                    promoted = self.global_workspace.promote(self.generation)
+                    if promoted:
+                        broadcast_genomes = self.global_workspace.broadcast(promoted)
+                        for agent in self.population.agents:
+                            for bg in broadcast_genomes:
+                                if bg != agent.genome:
+                                    agent.local_memory.store("global_broadcast", bg)
+                        logger.info(f"L5 promoted {len(promoted)} artifacts (attention: {max(p['attention'] for p in promoted):.3f})")
+                    self.global_workspace.apply_attention_decay(self.generation)
+                except Exception as exc:
+                    logger.debug(f"L5 workspace cycle failed: {exc}")
+
             if completed_rounds % 20 == 0 and completed_rounds > 0:
                 try:
                     codebook_ops = self.codebook.evolve(self.generation)
@@ -531,6 +553,7 @@ class Orchestrator:
                 elite = self.archive.get_elite()
                 metrics = self.population.get_metrics()
                 cb_codes = self.codebook.entry_count()
+                ws_size = self.global_workspace.size()
                 logger.info(
                     f"Round {completed_rounds:4d} | pop={metrics['size']:3d} "
                     f"| archive={self.archive.num_cells():3d} "
@@ -538,6 +561,7 @@ class Orchestrator:
                     f"| occupancy={self.archive.occupancy():.2f} "
                     f"| fail={metrics['failure_rate']:.2f}"
                     f"| cb={cb_codes}"
+                    f"| ws={ws_size}"
                 )
 
             elite = self.archive.get_elite()
@@ -567,4 +591,9 @@ class Orchestrator:
             "max_trust": self.archive.max_trust(),
             "best_genome": elite.genome if elite else "",
             "solved": solved,
+            "workspace_size": self.global_workspace.size(),
+            "workspace_contents": [
+                {"trust": s.trust, "attention": s.attention, "round": s.promoted_round}
+                for s in self.global_workspace.contents()[:3]
+            ],
         }
