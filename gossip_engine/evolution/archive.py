@@ -105,3 +105,40 @@ class MAPElitesArchive:
         entries = list(self._cells.values())
         entries.sort(key=lambda e: e.trust_score, reverse=True)
         return entries[0]
+
+    def reload_from_records(self, records: list[tuple]) -> int:
+        """Reload archive from stored (genome, trust, novelty, agent_id, lineage_hash, behavior, artifact_hash) tuples.
+
+        Returns number of cells populated.
+        """
+        count = 0
+        for record in records:
+            genome, trust, novelty, agent_id, lineage_hash, behavior, artifact_hash = record[:7]
+            inserted = self.insert(
+                genome=genome,
+                trust_score=trust,
+                novelty_score=novelty,
+                agent_id=agent_id,
+                lineage_hash=lineage_hash,
+                behavior=behavior,
+                artifact_hash=artifact_hash,
+            )
+            if inserted:
+                count += 1
+        return count
+
+    def save_snapshot(self) -> list[dict]:
+        """Return serializable snapshot of all archive cells."""
+        return [
+            {
+                "genome": entry.genome,
+                "trust_score": entry.trust_score,
+                "novelty_score": entry.novelty_score,
+                "agent_id": entry.agent_id,
+                "lineage_hash": entry.lineage_hash,
+                "artifact_hash": entry.artifact_hash,
+                "coords": list(entry.coords),
+                "age": entry.age,
+            }
+            for entry in self._cells.values()
+        ]

@@ -6,16 +6,8 @@ from pathlib import Path
 
 from .config import Config
 from .cli import run_interactive, _print_summary
+from .problem_studio import run_problem_studio
 from .orchestrator import Orchestrator
-
-
-def _prompt(prompt: str, default: str = "") -> str:
-    suffix = f" [{default}]" if default else ""
-    try:
-        value = input(f"{prompt}{suffix}: ").strip()
-    except EOFError:
-        return default
-    return value or default
 
 
 def main():
@@ -34,6 +26,8 @@ def main():
                         help="LLM model (overrides config)")
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="Open an interactive CLI after initialization")
+    parser.add_argument("--studio", action="store_true",
+                        help="Launch the structured problem-definition studio")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose logging")
     args = parser.parse_args()
@@ -68,13 +62,17 @@ def main():
     config._validate()
 
     domain_value = args.domain
-    if not domain_value and args.interactive:
-        if sys.stdin.isatty():
-            domain_value = _prompt("Domain module path", "domains/palindrome.py")
-        else:
-            domain_value = "domains/palindrome.py"
+    studio_mode = bool(args.studio or (args.interactive and not domain_value))
+    if studio_mode:
+        if not sys.stdin.isatty():
+            print("Error: structured problem studio requires an interactive terminal.", file=sys.stderr)
+            sys.exit(1)
+        generated_domain = run_problem_studio(config)
+        if not generated_domain:
+            sys.exit(1)
+        domain_value = generated_domain
     if not domain_value:
-        print("Error: domain module not provided. Use --domain or --interactive.", file=sys.stderr)
+        print("Error: domain module not provided. Use --domain, --interactive, or --studio.", file=sys.stderr)
         sys.exit(1)
 
     domain_path = Path(domain_value)
@@ -97,7 +95,7 @@ def main():
     print(f"Initial pop: {config.initial_population}-{config.initial_population + config.initial_population_jitter}")
     print()
 
-    if args.interactive:
+    if args.interactive and not studio_mode:
         run_interactive(orch, default_step_rounds=max(1, args.rounds or 1))
         return
 

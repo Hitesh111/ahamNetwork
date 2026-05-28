@@ -46,10 +46,22 @@ def _rename_function(code: str, expected_name: str = "solve") -> str:
         return code
 
 
-def create_immigrant_agent(domain_prompt: str, llm_backend, mr_s=0.05, mr_r=0.30, mr_t=0.50, rr_s=0.05, rr_r=0.30, rr_t=0.10) -> Agent:
+def create_immigrant_agent(
+    domain_prompt: str,
+    llm_backend,
+    context_block: str = "",
+    mr_s=0.05,
+    mr_r=0.30,
+    mr_t=0.50,
+    rr_s=0.05,
+    rr_r=0.30,
+    rr_t=0.10,
+) -> Agent:
     prompt = f"""Generate a single short Python function named 'solve' that solves this problem. It must be named exactly 'solve'.
 
 Problem: {domain_prompt}"""
+    if context_block.strip():
+        prompt += f"\n\nRelevant context:\n{context_block.strip()}"
     try:
         result = llm_backend.generate(prompt, temperature=0.9, max_tokens=1024)
         code = result.content.strip()

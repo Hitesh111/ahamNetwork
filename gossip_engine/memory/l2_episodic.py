@@ -216,6 +216,13 @@ class ArtifactStore:
             "last_seen": float(row["last_seen"] or 0.0),
         }
 
+    def update_trust(self, artifact_hash: str, new_trust: float) -> None:
+        self.conn.execute(
+            "UPDATE artifacts SET trust_score = ? WHERE artifact_hash = ?",
+            (new_trust, artifact_hash),
+        )
+        self.conn.commit()
+
     def compact(
         self,
         trust_threshold: float = 0.05,
@@ -228,6 +235,38 @@ class ArtifactStore:
         )
         self.conn.commit()
         return cursor.rowcount or 0
+
+    def best_per_niche(self, min_trust: float = 0.0) -> list[tuple]:
+        """Return the highest-trust artifact per unique niche bucket.
+
+        Each tuple: (genome, trust_score, novelty_score, agent_id, parent_hash, behavior, artifact_hash).
+        """
+        rows = self.conn.execute(
+            """
+            SELECT a.* FROM artifacts a
+            INNER JOIN (
+                SELECT niche_coords, MAX(trust_score) AS max_trust
+                FROM artifacts
+                WHERE trust_score >= ?
+                GROUP BY niche_coords
+            ) b ON a.niche_coords = b.niche_coords AND a.trust_score = b.max_trust
+            WHERE a.trust_score >= ?
+            ORDER BY a.trust_score DESC
+            """,
+            (min_trust, min_trust),
+        ).fetchall()
+        return [
+            (
+                row["content"],
+                row["trust_score"],
+                row["novelty_score"],
+                row["agent_id"],
+                row["parent_hash"],
+                tuple(json.loads(row["behavior"])),
+                row["artifact_hash"],
+            )
+            for row in rows
+        ]
 
     def close(self):
         self.conn.close()

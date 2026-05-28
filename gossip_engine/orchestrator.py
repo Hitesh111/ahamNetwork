@@ -71,7 +71,13 @@ class Orchestrator:
         self._domain_test_cases = None
         self._domain_test = ""
         self._domain_prompt = ""
+        self._domain_context = ""
         self._domain_solved = None
+
+    def _domain_prompt_text(self) -> str:
+        if self._domain_context.strip():
+            return f"{self._domain_prompt}\n\nRelevant context:\n{self._domain_context.strip()}"
+        return self._domain_prompt
 
     def load_domain(self, module_path: str):
         spec = importlib.util.spec_from_file_location("domain", module_path)
@@ -86,8 +92,9 @@ class Orchestrator:
         self._domain_test_cases = getattr(mod, "TEST_CASES", None)
         self._domain_test = getattr(mod, "test_code", "")
         self._domain_prompt = getattr(mod, "PROMPT", "")
+        self._domain_context = getattr(mod, "CONTEXT", "")
         self._domain_solved = getattr(mod, "is_solved", None)
-        self.mutation_engine.domain_prompt = self._domain_prompt
+        self.mutation_engine.domain_prompt = self._domain_prompt_text()
         logger.info(f"Loaded domain: {module_path}")
 
     def _sync_gossip_state(self):
@@ -345,6 +352,9 @@ class Orchestrator:
         artifact["lineage_depth"] = lineage_depth
         artifact["secondary_parent_hash"] = secondary_parent_hash
         artifact["inserted_into_archive"] = inserted
+
+        if trust > 0.8:
+            self._propagate_credit(artifact_hash, trust)
         return {
             "trust": trust,
             "artifact": artifact,
@@ -392,7 +402,7 @@ class Orchestrator:
             mutation_type = "mutate"
         elif not agent.genome and self._domain_prompt:
             if self.mutation_engine.llm_available:
-                immigrant = create_immigrant_agent(self._domain_prompt, self.llm)
+                immigrant = create_immigrant_agent(self._domain_prompt, self.llm, context_block=self._domain_context)
                 agent.genome = immigrant.genome
                 mutation_type = "immigrant"
             else:
@@ -425,7 +435,7 @@ class Orchestrator:
         for index, agent in enumerate(self.population.agents):
             if self._domain_prompt and self.llm:
                 try:
-                    immigrant = create_immigrant_agent(self._domain_prompt, self.llm)
+                    immigrant = create_immigrant_agent(self._domain_prompt, self.llm, context_block=self._domain_context)
                     agent.genome = immigrant.genome
                 except Exception:
                     agent.genome = "def solve(x): return x"
@@ -434,11 +444,44 @@ class Orchestrator:
             elif not agent.genome:
                 agent.genome = "def solve(x): return x"
 
+    def _reconcile_archive(self):
+        """Reload archive from persisted L2 store on restart."""
+        records = self.artifact_store.best_per_niche(min_trust=0.01)
+        if records:
+            loaded = self.archive.reload_from_records(records)
+            if loaded:
+                logger.info(f"Archive reconciled: {loaded} cells loaded from {len(records)} stored records")
+
+    def _propagate_credit(self, artifact_hash: str, trust_score: float):
+        """Propagate trust bonus back through lineage for high-trust artifacts.
+
+        Each ancestor gets +0.05 trust (capped at 0.95).
+        """
+        if trust_score < 0.8:
+            return
+        bonus = 0.05
+        ancestors = self.lineage_store.get_ancestors(artifact_hash, depth=50)
+        credited = set()
+        for node in ancestors:
+            if node.artifact_hash == artifact_hash or node.artifact_hash in credited:
+                continue
+            credited.add(node.artifact_hash)
+            old_trust = node.trust_score
+            new_trust = min(0.95, old_trust + bonus)
+            if new_trust > old_trust:
+                self._apply_credit(node.artifact_hash, new_trust)
+
+    def _apply_credit(self, artifact_hash: str, new_trust: float):
+        """Update trust in both lineage store and archive for a credited artifact."""
+        self.lineage_store.update_trust(artifact_hash, new_trust)
+        self.artifact_store.update_trust(artifact_hash, new_trust)
+
     def run(self, rounds: int | None = None) -> dict:
         target_rounds = self.cfg.rounds if rounds is None else self.generation + rounds
         if not self.population.agents:
             self.population.initialize()
             self._seed_population()
+        self._reconcile_archive()
         self._sync_gossip_state()
 
         solved = False
@@ -458,7 +501,7 @@ class Orchestrator:
                     self.lineage_store,
                 )
                 if growth_signals:
-                    self.population.grow(growth_signals, self.llm, self._domain_prompt)
+                    self.population.grow(growth_signals, self.llm, self._domain_prompt_text())
                     self._sync_gossip_state()
 
             if completed_rounds % self.cfg.shrink_check_interval == 0:

@@ -318,5 +318,12 @@ class LineageStore:
         self.conn.commit()
         return summary
 
+    def update_trust(self, artifact_hash: str, new_trust: float) -> None:
+        self.conn.execute(
+            "UPDATE nodes SET trust_score = ? WHERE artifact_hash = ?",
+            (new_trust, artifact_hash),
+        )
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
