@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re as _re
 import shlex
 from typing import Any
 
@@ -116,23 +117,70 @@ def print_help() -> None:
         "\n".join(
             [
                 "Commands:",
-                "  status            Show population, archive, and gossip summaries",
-                "  run [n]           Advance n rounds (default 1)",
-                "  step [n]          Alias for run",
-                "  elite             Show the best archive entry",
-                "  archive [n]       Show the top n archive entries",
-                "  agents            Show agent gossip/state table",
-                "  lineage <hash>    Show lineage stats for an artifact hash",
-                "  save              Write a checkpoint to disk",
-                "  help              Show this help",
-                "  quit / exit       Leave interactive mode",
+                "  status / s                      Show population, archive, and gossip summaries",
+                "  run [n] / step [n] / tick [n]   Advance n rounds (default 1)",
+                "  elite / best                    Show the best archive entry",
+                "  archive [n]                     Show the top n archive entries",
+                "  agents / pop                    Show agent gossip/state table",
+                "  lineage <hash>                  Show lineage stats for an artifact hash",
+                "  save                            Write a checkpoint to disk",
+                "  help / ?                        Show this help",
+                "  quit / exit / q                 Leave interactive mode",
+                "",
+                "Natural language examples:",
+                "  run 10 rounds",
+                "  show me the best solution",
+                "  what's the status",
+                "  advance 5 steps",
             ]
         )
     )
 
 
+def _parse_natural_command(raw: str) -> tuple[str, list[str]]:
+    """Parse a natural language input into command + args."""
+    raw_lower = raw.lower().strip()
+
+    aliases: dict[str, str] = {
+        "show me the best solution": "elite",
+        "what's the best": "elite",
+        "show elite": "elite",
+        "show best": "elite",
+        "what is the status": "status",
+        "what's the status": "status",
+        "show status": "status",
+        "show me the status": "status",
+        "what are the agents": "agents",
+        "show agents": "agents",
+        "show pop": "agents",
+        "show population": "agents",
+    }
+
+    for phrase, cmd in aliases.items():
+        if raw_lower.strip() == phrase:
+            return cmd, []
+
+    patterns: list[tuple[str, str]] = [
+        (_re.compile(r"run\s+(\d+)(?:\s*rounds?)?"), "run"),
+        (_re.compile(r"run\s+(\d+)\s*steps?"), "run"),
+        (_re.compile(r"advance\s+(\d+)"), "run"),
+        (_re.compile(r"step\s+(\d+)"), "run"),
+        (_re.compile(r"tick\s+(\d+)"), "run"),
+        (_re.compile(r"archive\s+(\d+)"), "archive"),
+        (_re.compile(r"lineage\s+(\S+)"), "lineage"),
+    ]
+
+    for pattern, command in patterns:
+        m = pattern.match(raw_lower)
+        if m:
+            return command, [m.group(1)]
+
+    return raw, []
+
+
 def run_interactive(orch, default_step_rounds: int = 1) -> None:
-    print("Interactive mode. Type 'help' for commands.")
+    print("Interactive mode. Type 'help' for commands, or just chat naturally.")
+    print("Examples: run 10 rounds, show best, what's the status")
     if not orch.population.agents:
         orch.population.initialize()
         orch._seed_population()
@@ -148,7 +196,8 @@ def run_interactive(orch, default_step_rounds: int = 1) -> None:
         if not raw:
             raw = "status"
 
-        parts = shlex.split(raw)
+        command, args = _parse_natural_command(raw)
+        parts = _re.split(r"\s+", raw.strip().lower()) if command == raw else [command] + args
         if not parts:
             continue
 

@@ -257,106 +257,233 @@ def _read_source(spec: ProblemSource) -> str:
     return spec.value
 
 
-def collect_problem_spec(config: Config) -> ProblemSpec | None:
-    print("=== Problem Studio ===")
-    print("assistant: Define the problem in a structured way. I will turn it into a domain and run the solver.")
-    print("assistant: Keep the answer schema tight. Examples must be JSON objects with input/output fields.")
-    print()
+def _parse_natural_description(text: str) -> dict[str, Any]:
+    """Parse a free-form problem description into structured fields.
+    Uses heuristics — no LLM required.
+    """
+    result: dict[str, Any] = {}
+    text_lower = text.lower()
 
-    title = _prompt_text("assistant: Problem title", required=True)
-    statement = _prompt_text("assistant: One-sentence problem statement", required=True)
-    input_kind = _prompt_choice(
-        "assistant: Input kind",
-        ["int", "string", "list", "dict", "json", "custom"],
-        default_index=1,
-    )
-    if input_kind == "custom":
-        input_kind = _prompt_text("assistant: Describe the input shape", required=True)
-    output_kind = _prompt_choice(
-        "assistant: Output kind",
-        ["bool", "int", "string", "list", "dict", "custom"],
-        default_index=0,
-    )
-    if output_kind == "custom":
-        output_kind = _prompt_text("assistant: Describe the output shape", required=True)
+    if "title" not in result:
+        first_line = text.strip().split("\n")[0][:60]
+        result["title"] = first_line if first_line else "Custom Problem"
+
+    result["statement"] = text.strip()
+
+    for kw in ("bool", "true/false", "true or false", "boolean", "yes/no"):
+        if kw in text_lower:
+            result["output_kind"] = "bool"
+            break
+    if "output_kind" not in result:
+        for kw in ("int", "integer", "number", "count"):
+            if kw in text_lower:
+                result["output_kind"] = "int"
+                break
+    if "output_kind" not in result:
+        for kw in ("string", "str", "text", "word"):
+            if kw in text_lower:
+                result["output_kind"] = "string"
+                break
+    if "output_kind" not in result:
+        result["output_kind"] = "custom"
+
+    for kw in ("int", "integer", "number"):
+        if kw in text_lower:
+            result["input_kind"] = "int"
+            break
+    if "input_kind" not in result:
+        for kw in ("string", "str", "text", "word", "character"):
+            if kw in text_lower:
+                result["input_kind"] = "string"
+                break
+    if "input_kind" not in result:
+        for kw in ("list", "array"):
+            if kw in text_lower:
+                result["input_kind"] = "list"
+                break
+    if "input_kind" not in result:
+        result["input_kind"] = "custom"
 
     examples: list[ProblemExample] = []
-    print("assistant: Add examples as JSON objects, e.g. {\"input\": 2, \"output\": true}")
-    while True:
-        example = _prompt_json_object("user example")
-        if example is None:
-            if examples:
-                break
-            print("assistant: You need at least one example to make the problem executable.")
-            continue
-        if "input" not in example or "output" not in example:
-            print("assistant: Example must contain 'input' and 'output'.")
-            continue
-        examples.append(
-            ProblemExample(
-                input_value=example["input"],
-                expected_output=example["output"],
-            )
-        )
-        if not _prompt_yes_no("assistant: Add another example", default=False):
-            break
+    example_pattern = re.compile(
+        r"input\s*[:=]\s*(.+?)\s*"
+        r"(?:output|result|=>|->|→)\s*[:=]?\s*(.+?)(?=,\s*input|\s*$|,\s*$)",
+        re.IGNORECASE,
+    )
+    for match in example_pattern.finditer(text):
+        try:
+            inp = _parse_literal(match.group(1).strip().strip('"').strip("'"))
+            out = _parse_literal(match.group(2).strip().strip('"').strip("'"))
+            examples.append(ProblemExample(input_value=inp, expected_output=out))
+        except Exception:
+            pass
+    if examples:
+        result["examples"] = examples
 
     constraints: list[str] = []
-    print("assistant: Add constraints as a JSON array of strings, or [] if none.")
+    constraint_lines = re.findall(
+        r"(?:constraint|must|should|require|assume)[^.]*\.", text, re.IGNORECASE
+    )
+    for line in constraint_lines:
+        cleaned = line.strip().lstrip(":- ").rstrip(".")
+        if cleaned and cleaned not in constraints and len(cleaned) > 10:
+            constraints.append(cleaned[:120])
+    if constraints:
+        result["constraints"] = constraints
+
+    return result
+
+
+def _prompt_missing_fields(spec: ProblemSpec) -> ProblemSpec:
+    """Prompt for any missing fields in the spec."""
+    if not spec.title or spec.title == "Custom Problem":
+        spec.title = _prompt_text("Problem title", default=spec.title, required=True)
+    if not spec.statement:
+        spec.statement = _prompt_text("One-sentence problem statement", required=True)
+    if not spec.input_kind or spec.input_kind == "custom":
+        spec.input_kind = _prompt_choice(
+            "Input kind",
+            ["int", "string", "list", "dict", "json", "custom"],
+            default_index=1,
+        )
+        if spec.input_kind == "custom":
+            spec.input_kind = _prompt_text("Describe the input shape", required=True)
+    if not spec.output_kind or spec.output_kind == "custom":
+        spec.output_kind = _prompt_choice(
+            "Output kind",
+            ["bool", "int", "string", "list", "dict", "json", "custom"],
+            default_index=0,
+        )
+        if spec.output_kind == "custom":
+            spec.output_kind = _prompt_text("Describe the output shape", required=True)
+    else:
+        print(f"  Output kind: {spec.output_kind} (change in step-by-step form with /structured)")
+    if not spec.examples:
+        print("Add examples as JSON, e.g. {\"input\": 2, \"output\": true}")
+        while True:
+            example = _prompt_json_object("example")
+            if example is None:
+                if spec.examples:
+                    break
+                print("You need at least one example.")
+                continue
+            if "input" not in example or "output" not in example:
+                print("Example must contain 'input' and 'output'.")
+                continue
+            spec.examples.append(
+                ProblemExample(
+                    input_value=example["input"],
+                    expected_output=example["output"],
+                )
+            )
+            if not _prompt_yes_no("Add another example", default=False):
+                break
+    if not spec.constraints:
+        spec.constraints = _prompt_constraints()
+    if not spec.sources and _prompt_yes_no("Add retrieval sources for RAG", default=False):
+        spec.sources = _prompt_sources()
+    return spec
+
+
+def _prompt_constraints() -> list[str]:
+    print("Constraints as a JSON array, or leave blank if none.")
     while True:
         try:
-            raw = input("user constraints: ").strip()
+            raw = input("constraints: ").strip()
         except EOFError:
             raw = ""
         if not raw:
-            break
+            return []
         try:
             parsed = json.loads(raw)
         except Exception:
             try:
                 parsed = ast.literal_eval(raw)
             except Exception:
-                print("assistant: Enter a JSON array, for example: [\"handle negatives\", \"use O(n)\"]")
+                print("Enter a JSON array, e.g.: [\"handle negatives\", \"use O(n)\"]")
                 continue
         if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
-            constraints = [item.strip() for item in parsed if item.strip()]
-            break
-        print("assistant: Constraints must be a list of strings.")
+            return [item.strip() for item in parsed if item.strip()]
+        print("Constraints must be a list of strings.")
 
+
+def _prompt_sources() -> list[ProblemSource]:
     sources: list[ProblemSource] = []
-    if _prompt_yes_no("assistant: Add retrieval sources for RAG", default=False):
-        print("assistant: Add sources as JSON objects like {\"kind\": \"file\", \"value\": \"docs/spec.md\"}")
-        print("assistant: Supported kinds: file, url, search, text")
-        while True:
-            source_raw = _prompt_json_object("user source")
-            if source_raw is None:
-                break
-            kind = str(source_raw.get("kind", "")).strip().lower()
-            value = str(source_raw.get("value", "")).strip()
-            if not kind or not value:
-                print("assistant: Source needs 'kind' and 'value'.")
-                continue
-            if kind not in {"file", "url", "search", "text"}:
-                print("assistant: Kind must be file, url, search, or text.")
-                continue
-            label = str(source_raw.get("label", "")).strip()
-            sources.append(ProblemSource(kind=kind, value=value, label=label))
-            if not _prompt_yes_no("assistant: Add another source", default=False):
-                break
+    print("Sources as JSON objects like {\"kind\": \"file\", \"value\": \"docs/spec.md\"}")
+    print("Supported kinds: file, url, search, text")
+    while True:
+        source_raw = _prompt_json_object("source")
+        if source_raw is None:
+            break
+        kind = str(source_raw.get("kind", "")).strip().lower()
+        value = str(source_raw.get("value", "")).strip()
+        if not kind or not value:
+            print("Source needs 'kind' and 'value'.")
+            continue
+        if kind not in {"file", "url", "search", "text"}:
+            print("Kind must be file, url, search, or text.")
+            continue
+        label = str(source_raw.get("label", "")).strip()
+        sources.append(ProblemSource(kind=kind, value=value, label=label))
+        if not _prompt_yes_no("Add another source", default=False):
+            break
+    return sources
 
+
+def collect_problem_spec(config: Config) -> ProblemSpec | None:
+    print("=== Problem Studio ===")
+    print("Describe your problem in plain English. I'll parse it and fill in the details.")
+    print("Type /structured to use the step-by-step form instead.")
+    print()
+
+    raw = ""
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            line = ""
+        if line == "/structured":
+            print("Using structured form...")
+            return _collect_structured_spec()
+        if line:
+            raw = line
+            break
+        print("Describe your problem, e.g.: 'Check if a number is prime, return True/False'")
+
+    if not raw:
+        return None
+
+    parsed = _parse_natural_description(raw)
     spec = ProblemSpec(
-        title=title,
-        statement=statement,
-        input_kind=input_kind,
-        output_kind=output_kind,
-        examples=examples,
-        constraints=constraints,
-        sources=sources,
+        title=parsed.get("title", raw[:60]),
+        statement=parsed.get("statement", raw),
+        input_kind=parsed.get("input_kind", ""),
+        output_kind=parsed.get("output_kind", ""),
+        examples=parsed.get("examples", []),
+        constraints=parsed.get("constraints", []),
+        sources=[],
     )
+
+    print()
+    print(f"--- Parsed: {spec.title} ---")
+    print(f"  Input kind:  {spec.input_kind or '?'}")
+    print(f"  Output kind: {spec.output_kind or '?'}")
+    print(f"  Examples:    {len(spec.examples)}")
+    print(f"  Constraints: {len(spec.constraints)}")
+    print()
+
+    if spec.examples:
+        for ex in spec.examples:
+            print(f"  {ex.input_value!r} -> {ex.expected_output!r}")
+
+    print()
+    if _prompt_yes_no("Fill in missing details", default=True):
+        spec = _prompt_missing_fields(spec)
+
     spec.context_block = build_context_block(spec)
 
     print()
-    print("assistant: Structured spec preview")
+    print("Spec preview")
     print(format_kv(
         {
             "title": spec.title,
@@ -370,12 +497,75 @@ def collect_problem_spec(config: Config) -> ProblemSpec | None:
     ))
     if spec.context_block:
         print()
-        print("assistant: Retrieved context")
+        print("Retrieved context")
         print(spec.context_block[:2000])
 
-    if not _prompt_yes_no("assistant: Materialize and solve this problem", default=True):
+    if not _prompt_yes_no("Materialize and solve this problem", default=True):
         return None
     return spec
+
+
+def _collect_structured_spec() -> ProblemSpec | None:
+    """Original step-by-step form as a fallback."""
+    print()
+    title = _prompt_text("Problem title", required=True)
+    statement = _prompt_text("One-sentence problem statement", required=True)
+    input_kind = _prompt_choice(
+        "Input kind",
+        ["int", "string", "list", "dict", "json", "custom"],
+        default_index=1,
+    )
+    if input_kind == "custom":
+        input_kind = _prompt_text("Describe the input shape", required=True)
+    output_kind = _prompt_choice(
+        "Output kind",
+        ["bool", "int", "string", "list", "dict", "custom"],
+        default_index=0,
+    )
+    if output_kind == "custom":
+        output_kind = _prompt_text("Describe the output shape", required=True)
+
+    examples: list[ProblemExample] = _prompt_examples()
+    constraints: list[str] = _prompt_constraints()
+    sources: list[ProblemSource] = []
+    if _prompt_yes_no("Add retrieval sources for RAG", default=False):
+        sources = _prompt_sources()
+
+    spec = ProblemSpec(
+        title=title,
+        statement=statement,
+        input_kind=input_kind,
+        output_kind=output_kind,
+        examples=examples,
+        constraints=constraints,
+        sources=sources,
+    )
+    spec.context_block = build_context_block(spec)
+    return spec
+
+
+def _prompt_examples() -> list[ProblemExample]:
+    examples: list[ProblemExample] = []
+    print("Add examples as JSON, e.g. {\"input\": 2, \"output\": true}")
+    while True:
+        example = _prompt_json_object("example")
+        if example is None:
+            if examples:
+                break
+            print("You need at least one example.")
+            continue
+        if "input" not in example or "output" not in example:
+            print("Example must contain 'input' and 'output'.")
+            continue
+        examples.append(
+            ProblemExample(
+                input_value=example["input"],
+                expected_output=example["output"],
+            )
+        )
+        if not _prompt_yes_no("Add another example", default=False):
+            break
+    return examples
 
 
 def build_context_block(spec: ProblemSpec, limit: int = 5) -> str:
