@@ -1,11 +1,11 @@
-PROMPT = "Return the larger of two numbers."
+PROMPT = "Return the larger of two numbers in a list."
 
 TEST_CASES = [
-    ((1, 2), 2),
-    ((5, 5), 5),
-    ((-1, 10), 10),
-    ((100, 0), 100),
-    ((-5, -1), -1),
+    ([1, 2], 2),
+    ([5, 5], 5),
+    ([-1, 10], 10),
+    ([100, 0], 100),
+    ([-5, -1], -1),
 ]
 
 
@@ -30,9 +30,9 @@ def is_solved(code: str, trust: float) -> bool:
 
 
 test_code = """
-if solve(1, 2) != 2: raise AssertionError()
-if solve(5, 5) != 5: raise AssertionError()
-if solve(-1, 10) != 10: raise AssertionError()
-if solve(100, 0) != 100: raise AssertionError()
-if solve(-5, -1) != -1: raise AssertionError()
+if solve([1, 2]) != 2: raise AssertionError()
+if solve([5, 5]) != 5: raise AssertionError()
+if solve([-1, 10]) != 10: raise AssertionError()
+if solve([100, 0]) != 100: raise AssertionError()
+if solve([-5, -1]) != -1: raise AssertionError()
 """

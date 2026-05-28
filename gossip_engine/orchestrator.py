@@ -24,6 +24,7 @@ from .memory.l2_episodic import ArtifactRecord, ArtifactStore
 from .memory.l3_lineage import LineageStore
 from .memory.l4_codebook import CodebookStore
 from .memory.l5_workspace import GlobalWorkspace
+from .critic import StepBackCritic
 from .population.manager import PopulationManager
 from .utils.ids import content_hash
 from .utils.log import setup_logging
@@ -68,6 +69,7 @@ class Orchestrator:
         self.lineage_store = LineageStore(checkpoint_dir / "lineage.sqlite3")
         self.codebook = CodebookStore(checkpoint_dir / "codebook.sqlite3")
         self.global_workspace = GlobalWorkspace(checkpoint_dir / "workspace.sqlite3")
+        self.critic = StepBackCritic(llm_backend=self.llm)
 
         self._domain_module = None
         self._domain_fitness = None
@@ -99,6 +101,7 @@ class Orchestrator:
         self._domain_context = getattr(mod, "CONTEXT", "")
         self._domain_solved = getattr(mod, "is_solved", None)
         self.mutation_engine.domain_prompt = self._domain_prompt_text()
+        self.critic.domain_prompt = self._domain_prompt_text()
         logger.info(f"Loaded domain: {module_path}")
 
     def _sync_gossip_state(self):
@@ -549,11 +552,46 @@ class Orchestrator:
                 except Exception as exc:
                     logger.debug(f"Codebook evolution failed: {exc}")
 
+            if completed_rounds % 15 == 0:
+                try:
+                    elite = self.archive.get_elite()
+                    insight = self.critic.analyze(
+                        population_size=self.population.size,
+                        archive_cells=self.archive.num_cells(),
+                        archive_occupancy=self.archive.occupancy(),
+                        codebook_entries=self.codebook.entry_count(),
+                        workspace_size=self.global_workspace.size(),
+                        best_trust=elite.trust_score if elite else 0.0,
+                        max_trust_seen=self.archive.max_trust(),
+                        elapsed_rounds=completed_rounds,
+                        domain_solved=solved,
+                        population_agents=self.population.agents,
+                        archive=self.archive,
+                    )
+                    adj = insight.parameter_adjustments
+                    if adj:
+                        for agent in self.population.agents:
+                            mr = agent.state_machine.mutation_rate
+                            agent.state_machine._mr[agent.state_machine.state] = min(
+                                0.9, mr + adj.get("mutation_rate_bonus", 0.0)
+                            )
+                        logger.info(
+                            f"Critic: focus={insight.suggested_focus} "
+                            f"div={insight.diversity_score:.2f} stag={insight.stagnation_score:.2f} "
+                            f"adj={adj}"
+                        )
+                except Exception as exc:
+                    logger.debug(f"Critic analysis failed: {exc}")
+
             if completed_rounds % 10 == 0:
                 elite = self.archive.get_elite()
                 metrics = self.population.get_metrics()
                 cb_codes = self.codebook.entry_count()
                 ws_size = self.global_workspace.size()
+                critic_latest = self.critic.latest()
+                critic_tag = ""
+                if critic_latest and critic_latest.suggested_focus != "balanced_exploration":
+                    critic_tag = f" | critic: {critic_latest.suggested_focus}"
                 logger.info(
                     f"Round {completed_rounds:4d} | pop={metrics['size']:3d} "
                     f"| archive={self.archive.num_cells():3d} "
@@ -562,6 +600,7 @@ class Orchestrator:
                     f"| fail={metrics['failure_rate']:.2f}"
                     f"| cb={cb_codes}"
                     f"| ws={ws_size}"
+                    f"{critic_tag}"
                 )
 
             elite = self.archive.get_elite()
@@ -596,4 +635,5 @@ class Orchestrator:
                 {"trust": s.trust, "attention": s.attention, "round": s.promoted_round}
                 for s in self.global_workspace.contents()[:3]
             ],
+            "critic_history": self.critic.get_history(5),
         }
