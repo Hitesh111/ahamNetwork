@@ -22,6 +22,7 @@ from .grounding.cache import ExecutionCache
 from .llm.backend import create_backend
 from .memory.l2_episodic import ArtifactRecord, ArtifactStore
 from .memory.l3_lineage import LineageStore
+from .memory.l4_codebook import CodebookStore
 from .population.manager import PopulationManager
 from .utils.ids import content_hash
 from .utils.log import setup_logging
@@ -64,6 +65,7 @@ class Orchestrator:
         self.checkpoint_path = checkpoint_dir / "checkpoint.json"
         self.artifact_store = ArtifactStore(checkpoint_dir / "artifacts.sqlite3")
         self.lineage_store = LineageStore(checkpoint_dir / "lineage.sqlite3")
+        self.codebook = CodebookStore(checkpoint_dir / "codebook.sqlite3")
 
         self._domain_module = None
         self._domain_fitness = None
@@ -353,6 +355,13 @@ class Orchestrator:
         artifact["secondary_parent_hash"] = secondary_parent_hash
         artifact["inserted_into_archive"] = inserted
 
+        try:
+            cb_idx, cb_sim, _ = self.codebook.encode(agent.genome, round=self.generation)
+            context = self.codebook.get_activation_context(agent.genome, top_k=3)
+            artifact["codebook_indices"] = [cb_idx] + [c["index"] for c in context if c["index"] != cb_idx]
+        except Exception:
+            pass
+
         if trust > 0.8:
             self._propagate_credit(artifact_hash, trust)
         return {
@@ -510,15 +519,25 @@ class Orchestrator:
                     self.population.shrink(shrink_signals)
                     self._sync_gossip_state()
 
+            if completed_rounds % 20 == 0 and completed_rounds > 0:
+                try:
+                    codebook_ops = self.codebook.evolve(self.generation)
+                    if any(v > 0 for v in codebook_ops.values()):
+                        logger.info(f"Codebook evolution: {codebook_ops}")
+                except Exception as exc:
+                    logger.debug(f"Codebook evolution failed: {exc}")
+
             if completed_rounds % 10 == 0:
                 elite = self.archive.get_elite()
                 metrics = self.population.get_metrics()
+                cb_codes = self.codebook.entry_count()
                 logger.info(
                     f"Round {completed_rounds:4d} | pop={metrics['size']:3d} "
                     f"| archive={self.archive.num_cells():3d} "
                     f"| best={(elite.trust_score if elite else 0.0):.3f} "
                     f"| occupancy={self.archive.occupancy():.2f} "
                     f"| fail={metrics['failure_rate']:.2f}"
+                    f"| cb={cb_codes}"
                 )
 
             elite = self.archive.get_elite()
